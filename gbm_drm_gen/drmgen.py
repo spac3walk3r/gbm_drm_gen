@@ -388,7 +388,7 @@ class DRMGen(object):
 
 
     @property
-    def postion_interpolator(self) -> gbmgeometry.PositionInterpolator:
+    def position_interpolator(self) -> gbmgeometry.PositionInterpolator:
 
         return self._position_interpolator
 
@@ -645,7 +645,7 @@ class DRMGen(object):
 
         return [az, el]
 
-    def _make_drm_numba(self, src_az, src_el, geo_az, geo_el):
+    def _make_drm_numba(self, src_az, src_el, geo_az, geo_el, use_NN=False):
 
         # move outside loop
         n_tmp_phot_bin = 2 * self._nobins_in + self._nobins_in % 2
@@ -655,39 +655,51 @@ class DRMGen(object):
         tmp_phot_bin[1::2] = 10 ** (
             (np.log10(self._in_edge[:-1]) + np.log10(self._in_edge[1:])) / 2.0
         )
-        return _build_drm(
-            src_az,
-            src_el,
-            geo_az,
-            geo_el,
-            nobins_in=self._nobins_in,
-            nobins_out=self._nobins_out,
-            Azimuth=self._database_nb.Azimuth,
-            Zenith=self._database_nb.Zenith,
-            grid_points_list=self._database_nb.grid_points_list,
-            milliaz=self._database_nb.milliaz,
-            millizen=self._database_nb.millizen,
-            in_edge=self._in_edge,
-            lat_edge=self._database_nb.lat_edge,
-            lat_cent=self._database_nb.lat_cent,
-            theta_cent=self._database_nb.theta_cent,
-            phi_cent=self._database_nb.phi_cent,
-            double_phi_cent=self._database_nb.double_phi_cent,
-            ienerg=self._database_nb.ienerg,
-            out_edge=self._out_edge,
-            ein=self._ein,
-            epx_lo=self._database_nb.epx_lo,
-            epx_hi=self._database_nb.epx_hi,
-            ichan=self._database_nb.ichan,
-            matrix_type=self._matrix_type,
-            rsps=self._database_nb.rsps,
-            n_tmp_phot_bin=n_tmp_phot_bin,
-            tmp_phot_bin=tmp_phot_bin,
-            at_scat_data=self._database_nb.at_scat_data,
-            trigdat_precalc_rsps=self._database_precalc_trigdat.rsps,
-            trigdat=self._trigdat,
-            trigdat_mask=self._trigdat_mask
-        )
+        
+        # _build_drm returns final_drm, which is also final product of the NN
+         
+        if use_NN == True:
+            return _build_drm_NN()
+        
+        else:
+        
+            return _build_drm(
+                src_az,
+                src_el,
+                geo_az,
+                geo_el,
+                nobins_in=self._nobins_in,
+                nobins_out=self._nobins_out,
+                Azimuth=self._database_nb.Azimuth,
+                Zenith=self._database_nb.Zenith,
+                grid_points_list=self._database_nb.grid_points_list,
+                milliaz=self._database_nb.milliaz,
+                millizen=self._database_nb.millizen,
+                in_edge=self._in_edge,
+                lat_edge=self._database_nb.lat_edge,
+                lat_cent=self._database_nb.lat_cent,
+                theta_cent=self._database_nb.theta_cent,
+                phi_cent=self._database_nb.phi_cent,
+                double_phi_cent=self._database_nb.double_phi_cent,
+                ienerg=self._database_nb.ienerg,
+                out_edge=self._out_edge,
+                ein=self._ein,
+                epx_lo=self._database_nb.epx_lo,
+                epx_hi=self._database_nb.epx_hi,
+                ichan=self._database_nb.ichan,
+                matrix_type=self._matrix_type,
+                rsps=self._database_nb.rsps,
+                n_tmp_phot_bin=n_tmp_phot_bin,
+                tmp_phot_bin=tmp_phot_bin,
+                at_scat_data=self._database_nb.at_scat_data,
+                trigdat_precalc_rsps=self._database_precalc_trigdat.rsps,
+                trigdat=self._trigdat,
+                trigdat_mask=self._trigdat_mask
+            )
+
+
+    
+
 
 
 @nb.njit(fastmath=True, parallel=False)
