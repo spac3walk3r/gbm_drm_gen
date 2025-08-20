@@ -1,8 +1,8 @@
-#from .drmgen import DRMGen
+from .drmgen import DRMGen
 from .drmgen_tte import DRMGenTTE
 from .drmgen_trig import DRMGenTrig
+from .drmgen_mock import DRMGenMock
 
-from .drmgen import DRMGen
 
 from .create_rsp2 import create_rsp2
 
@@ -27,6 +27,7 @@ except:
 __all__ = [
     "DRMGenTTE",
     "DRMGenTrig",
+    "DRMGenMock",
     "NaiTTEEdges",
     "BgoTTEEdges",
     "BALROG_DRM",

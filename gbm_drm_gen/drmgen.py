@@ -659,7 +659,8 @@ class DRMGen(object):
         # _build_drm returns final_drm, which is also final product of the NN
          
         if use_NN == True:
-            return _build_drm_NN()
+        #    return _build_drm_NN()
+            print('using nN)')
         
         else:
         
