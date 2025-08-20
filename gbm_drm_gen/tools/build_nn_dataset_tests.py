@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-High-throughput NN DRM training dataset generator.
+Parallel NN DRM training dataset generator.
 
-- Single multiprocessing Pool across all detectors and all samples
-- Preloads DRM generators before forking so large DB arrays are fork-shared
-- Streams results to HDF5 in batches (append), avoiding large RAM spikes
-- Samples only visible geometries (source above Earth limb by a fixed angle)
+Generates (input_features, DRMs) for a list of GBM detectors (either all NaIs or BGOs),
+sampling realistic spacecraft geometry and embedding detector orientation vectors.
+
+- Uses DRMGenMock(det_name, occult=False) and per-process caching for speed.
+- Samples only visible geometries (source above Earth limb) using a fixed limb angle.
+- Saves inputs, drms, det_id (int), and det_name (UTF-8 string) to HDF5.
+
+For using locally and doing small dataset generation tests.
+
 """
 
-import os
+import os, logging, warnings
 
 # Silence thread-count warnings and avoid oversubscription
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
-import logging, warnings
 
 # Make logging quiet (must be set before threeML/astromodels import)
 logging.basicConfig(level=logging.ERROR)
@@ -33,13 +36,19 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 from tqdm import tqdm
 
+from gbm_drm_gen.drmgen_mock import DRMGenMock
+
 # --------------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------------
 
+N_SAMPLES_PER_DET = 10                  # per detector
+OUTPUT_FILE = "nais_training.h5"        # change to bgos_training.h5 for BGOs
+SEED_GLOBAL = 42
+
 # Visibility control (keep source above Earth limb by at least this angle)
 ENFORCE_VISIBILITY = True
-LIMB_ANGLE_DEG = 23.8  # ~Fermi limb angle at ~565 km altitude
+LIMB_ANGLE_DEG = 23.8  # ~Fermi-typical limb angle at ~565 km altitude
 
 # Detector orientation (az, zen) in degrees (detector normal in spacecraft frame)
 det_orient_deg = {
@@ -145,80 +154,45 @@ def sample_coords(n_samples,
             np.concatenate(ga_all), np.concatenate(ge_all))
 
 # --------------------------------------------------------------------------------
-# PARALLEL WORKER SUPPORT
+# PARALLEL WORKER
 # --------------------------------------------------------------------------------
 
-# Global cache of DRM generators; created in the parent BEFORE forking.
+# Per-process cache of DRM generators to avoid reloading DBs
 _GEN_CACHE = {}
 
-def preload_generators(det_list):
-    """
-    Preload DRMGenMock for each detector in the parent process, so that
-    large, read-only DB arrays are fork-shared among worker processes (copy-on-write).
-    """
-    from gbm_drm_gen.drmgen_mock import DRMGenMock
-    for det in det_list:
-        if det not in _GEN_CACHE:
-            _GEN_CACHE[det] = DRMGenMock(det_name=det, occult=False)
+def process_sample(det_name, src_az, src_el, geo_az, geo_el):
+    """Generate one sample: (features, DRM_flat, det_id, det_name)."""
+    gen = _GEN_CACHE.get(det_name)
+    if gen is None:
+        gen = DRMGenMock(det_name=det_name, occult=False)  # occult off: no zero DRMs
+        _GEN_CACHE[det_name] = gen
 
-def process_sample_cached(args):
-    """
-    Worker function (for imap_unordered). Uses preloaded generators from _GEN_CACHE.
-    Returns (features, drm_flat, det_id, det_name).
-    """
-    det_name, src_az, src_el, geo_az, geo_el = args
-    gen = _GEN_CACHE[det_name]
     drm_matrix = gen.recompute(src_az, src_el, geo_az, geo_el)
 
+    # Input features: src_az, src_el, geo_az, geo_el, detector normal (nx, ny, nz)
     nx, ny, nz = det_orient_vec[det_name]
     features = np.array([src_az, src_el, geo_az, geo_el, nx, ny, nz], dtype=np.float32)
+
     det_id = np.int16(DET_NAME_TO_ID[det_name])
 
     return features, drm_matrix.flatten().astype(np.float32), det_id, det_name
 
-def _mp_init():
-    """
-    Initializer for worker processes: keep workers single-threaded and quiet.
-    """
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-    os.environ.setdefault("BLIS_NUM_THREADS", "1")
-
 # --------------------------------------------------------------------------------
-# DATASET BUILD (single Pool across all detectors)
+# DATASET BUILD
 # --------------------------------------------------------------------------------
 
-def build_dataset(det_list,
-                  n_samples_per_det,
-                  output_file,
-                  seed_global=42,
-                  processes=None,
-                  chunksize=256,
-                  bufsize=1024):
-    """
-    Build HDF5 dataset for given detectors with a single multiprocessing Pool.
-
-    - det_list: list of detector names, e.g., ["NAI_00", ..., "NAI_11"] or ["BGO_00","BGO_01"]
-    - n_samples_per_det: int, number of samples per detector
-    - output_file: path to HDF5 output
-    - processes: number of worker processes (default: cpu_count())
-    - chunksize: how many tasks each worker grabs per round
-    - bufsize: how many results to buffer before appending to HDF5
-    """
+def build_dataset(det_list, n_samples_per_det, output_file, seed_global=42):
+    """Build HDF5 dataset for given detectors."""
     rng = np.random.default_rng(seed_global)
-    processes = processes or cpu_count()
+    all_features = []
+    all_drms = []
+    all_det_ids = []
+    all_det_names = []
 
-    # 1) Preload DRM generators in parent before forking
-    preload_generators(det_list)
-
-    # 2) Build the task list across all detectors
-    tasks = []
     for det_name in det_list:
-        print(f"Sampling for {det_name}...")
-        sa, se, ga, ge = sample_coords(
+        print(f"Generating for {det_name}...")
+
+        src_az, src_el, geo_az, geo_el = sample_coords(
             n_samples_per_det,
             limb_emphasis=True,
             rare_fraction=0.05,
@@ -226,74 +200,46 @@ def build_dataset(det_list,
             enforce_vis=ENFORCE_VISIBILITY,
             limb_angle_deg=LIMB_ANGLE_DEG,
         )
-        tasks.extend((det_name, a, b, c, d) for a, b, c, d in zip(sa, se, ga, ge))
 
-    # 3) Probe one result to size datasets
-    f0, y0, id0, name0 = process_sample_cached(tasks[0])
-    flat_len = y0.size
-    feat_len = f0.size
+        with Pool(processes=cpu_count()) as pool:
+            worker = partial(process_sample, det_name)
+            iterable = zip(src_az, src_el, geo_az, geo_el)
+            results = list(tqdm(pool.starmap(worker, iterable), total=n_samples_per_det))
 
-    # 4) Create extendable HDF5 datasets and stream-append
+        # Unpack results
+        if results:
+            features_det, drms_det, ids_det, names_det = zip(*results)
+            all_features.extend(features_det)
+            all_drms.extend(drms_det)
+            all_det_ids.extend(ids_det)
+            all_det_names.extend(names_det)
+
+    # Convert to arrays
+    all_features = np.stack(all_features).astype(np.float32)
+    all_drms = np.stack(all_drms).astype(np.float32)
+    all_det_ids = np.asarray(all_det_ids, dtype=np.int16)
+    all_det_names = np.asarray(all_det_names, dtype=object)
+
+    # Save to HDF5
     with h5py.File(output_file, "w") as f:
-        ds_X = f.create_dataset("inputs", shape=(0, feat_len), maxshape=(None, feat_len), dtype="f4", chunks=True)
-        ds_Y = f.create_dataset("drms",   shape=(0, flat_len), maxshape=(None, flat_len), dtype="f4", chunks=True)
-        ds_id = f.create_dataset("det_id", shape=(0,), maxshape=(None,), dtype="i2", chunks=True)
+        f.create_dataset("inputs", data=all_features)
+        f.create_dataset("drms", data=all_drms)
+        f.create_dataset("det_id", data=all_det_ids)
+        # Store names as variable-length UTF-8 strings
         str_dt = h5py.string_dtype(encoding="utf-8")
-        ds_nm = f.create_dataset("det_name", shape=(0,), maxshape=(None,), dtype=str_dt, chunks=True)
-
-        def append_batch(batch):
-            n_old = ds_X.shape[0]
-            n_add = len(batch)
-            if n_add == 0:
-                return
-            n_new = n_old + n_add
-            ds_X.resize((n_new, feat_len))
-            ds_Y.resize((n_new, flat_len))
-            ds_id.resize((n_new,))
-            ds_nm.resize((n_new,))
-            for j, (features, drm_flat, det_id_j, det_name_j) in enumerate(batch):
-                ds_X[n_old + j] = features
-                ds_Y[n_old + j] = drm_flat
-                ds_id[n_old + j] = det_id_j
-                ds_nm[n_old + j] = det_name_j
-
-        # 5) Parallel map with a single Pool over all tasks; stream results
-        print(f"Launching Pool with {processes} processes; writing to {output_file}")
-        with Pool(processes=processes, initializer=_mp_init) as pool:
-            buffer = []
-            for res in tqdm(pool.imap_unordered(process_sample_cached, tasks, chunksize=chunksize),
-                            total=len(tasks)):
-                buffer.append(res)
-                if len(buffer) >= bufsize:
-                    append_batch(buffer)
-                    buffer.clear()
-            if buffer:
-                append_batch(buffer)
+        f.create_dataset("det_name", data=all_det_names.astype(str_dt))
 
     print(f"Saved {output_file}")
+    print(f"Features shape: {all_features.shape}")
+    print(f"DRMs shape: {all_drms.shape}")
+    print(f"det_id shape: {all_det_ids.shape}, det_name shape: {all_det_names.shape}")
 
 # --------------------------------------------------------------------------------
-# CLI EXAMPLE
-# --------------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    # Example: build NaI dataset
-    N_SAMPLES_PER_DET = 10
-    OUTPUT_FILE = "nais_training.h5"
+    # Example for NaI model:
     NAI_DETECTORS = [f"NAI_{i:02d}" for i in range(12)]
+    build_dataset(NAI_DETECTORS, N_SAMPLES_PER_DET, OUTPUT_FILE, SEED_GLOBAL)
 
-    # Strongly suggested: set thread env vars before imports when running as a script.
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-    os.environ.setdefault("BLIS_NUM_THREADS", "1")
-
-    build_dataset(NAI_DETECTORS, N_SAMPLES_PER_DET, OUTPUT_FILE, seed_global=42,
-                  processes=min(96, cpu_count()), chunksize=256, bufsize=1024)
-
-    # Example: build BGO dataset
+    # Example for BGO model (uncomment to use):
     # BGO_DETECTORS = ["BGO_00", "BGO_01"]
-    # build_dataset(BGO_DETECTORS, N_SAMPLES_PER_DET, "bgos_training.h5", seed_global=42,
-    #               processes=min(96, cpu_count()), chunksize=256, bufsize=1024)
+    # build_dataset(BGO_DETECTORS, N_SAMPLES_PER_DET, "bgos_training.h5", SEED_GLOBAL)
