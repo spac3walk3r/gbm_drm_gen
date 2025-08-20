@@ -1,6 +1,7 @@
 import os, time, csv
 import math
 import numpy as np
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -34,12 +35,20 @@ def laplacian_smoothness(yhat_flat, n_out, n_in, weight=0.0):
     dx = y2d[:, :, 1:] - y2d[:, :, :-1]
     return weight * (dx.pow(2).mean() + dy.pow(2).mean())
 
-def train_one_epoch(model, loader, opt, device, n_out, n_in, lam_smooth=0.0):
+def train_one_epoch(model, loader, opt, device, n_out, n_in, lam_smooth=0.0, progress=True):
     model.train()
     mse = nn.MSELoss()
     total = 0.0
     n = 0
-    for batch in loader:
+
+    it = loader
+    if progress:
+        try:
+            it = tqdm(loader, desc="train", total=len(loader), leave=False)
+        except TypeError:
+            it = tqdm(loader, desc="train", leave=False)
+
+    for batch in it:
         angles = batch["angles"].to(device)
         normals = batch["normals"].to(device)
         y = batch["y"].to(device)               # log1p target
@@ -57,30 +66,44 @@ def train_one_epoch(model, loader, opt, device, n_out, n_in, lam_smooth=0.0):
         bs = angles.size(0)
         total += float(loss.item()) * bs
         n += bs
+
     return total / max(1, n)
 
 @torch.no_grad()
-def eval_one_epoch(model, loader, device, n_out, n_in, lam_smooth=0.0):
+def eval_one_epoch(model, loader, device, n_out, n_in, lam_smooth=0.0, progress=True):
     model.eval()
     mse = nn.MSELoss()
     total = 0.0
     n = 0
-    for batch in loader:
+
+    it = loader
+    if progress:
+        # len(loader) is available for standard DataLoader; if not, tqdm still works without total
+        try:
+            it = tqdm(loader, desc="val", total=len(loader), leave=False)
+        except TypeError:
+            it = tqdm(loader, desc="val", leave=False)
+
+    for batch in it:
         angles = batch["angles"].to(device)
         normals = batch["normals"].to(device)
-        y = batch["y"].to(device)
+        y = batch["y"].to(device)  # log1p target
         det_id = batch.get("det_id", None)
         if det_id is not None:
             det_id = det_id.to(device)
+
         yhat = model(angles, normals, det_id)
         loss = mse(yhat, y) + laplacian_smoothness(yhat, n_out, n_in, lam_smooth)
+
         bs = angles.size(0)
         total += float(loss.item()) * bs
         n += bs
+
     return total / max(1, n)
 
+
 @torch.no_grad()
-def eval_metrics_linear(model, loader, device):
+def eval_metrics_linear(model, loader, device, progress=True):
     import torch.nn.functional as F
     model.eval()
     n_samples = 0
@@ -88,10 +111,17 @@ def eval_metrics_linear(model, loader, device):
     rel_mae_list = []
     cos_list = []
 
-    for batch in loader:
+    it = loader
+    if progress:
+        try:
+            it = tqdm(loader, desc="val-metrics", total=len(loader), leave=False)
+        except TypeError:
+            it = tqdm(loader, desc="val-metrics", leave=False)
+
+    for batch in it:
         angles = batch["angles"].to(device)
         normals = batch["normals"].to(device)
-        y_log = batch["y"].to(device)  # log1p
+        y_log = batch["y"].to(device)  # log1p target
         det_id = batch.get("det_id", None)
         if det_id is not None:
             det_id = det_id.to(device)
@@ -100,13 +130,16 @@ def eval_metrics_linear(model, loader, device):
         y = torch.expm1(y_log).clamp_min_(0)
         yhat = torch.expm1(yhat_log).clamp_min_(0)
 
-        rmse = torch.sqrt(torch.mean((yhat - y) ** 2, dim=1))
+        # RMSE per-sample, average over samples
+        rmse = torch.sqrt(torch.mean((yhat - y) ** 2, dim=1))  # [B]
         rmse_sum += float(rmse.sum().item())
 
+        # Relative MAE per-sample: median over entries (robust)
         denom = (y.abs() + 1e-12)
-        rel_mae = torch.median((yhat - y).abs() / denom, dim=1).values
+        rel_mae = torch.median((yhat - y).abs() / denom, dim=1).values  # [B]
         rel_mae_list.append(rel_mae.cpu().numpy())
 
+        # Cosine similarity per-sample
         y_n = F.normalize(y.view(y.size(0), -1), dim=1)
         yhat_n = F.normalize(yhat.view(yhat.size(0), -1), dim=1)
         cos = torch.sum(y_n * yhat_n, dim=1)
