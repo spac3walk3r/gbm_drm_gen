@@ -20,7 +20,7 @@ class DRMNet(nn.Module):
     - For BGO models (one per detector): use_embedding=False
     """
     def __init__(self, out_len, use_embedding=False, num_det=12, emb_dim=8,
-                 hidden=(256, 512, 512), use_log_target=True):
+                 hidden=(256, 512, 512), use_log_target=True, low_rank_k=None):
                  #hidden=(128, 256), use_log_target=True):
                  
         super().__init__()
@@ -39,7 +39,11 @@ class DRMNet(nn.Module):
         for h in hidden:
             layers += [nn.Linear(last, h), nn.ReLU()]
             last = h
-        layers += [nn.Linear(last, out_len)]
+        if low_rank_k is None:
+            layers += [nn.Linear(last, out_len)]
+        else:
+            layers += [nn.Linear(last, low_rank_k), nn.ReLU(),
+                       nn.Linear(low_rank_k, out_len)]
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, angles_deg, normals, det_id=None):

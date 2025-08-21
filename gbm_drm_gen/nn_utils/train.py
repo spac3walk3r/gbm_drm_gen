@@ -159,7 +159,7 @@ def eval_metrics_linear(model, loader, device, progress=True):
 
 def fit_model(h5_path, out_len, n_out, n_in, save_path,
               use_embedding=False, num_det=12,
-              hidden=(256, 512, 512), emb_dim=8,
+              hidden=(256, 512, 512), emb_dim=8, low_rank_k=None,
               batch_size=128, lr=1e-3, epochs=30, val_frac=0.1,
               lam_smooth=0.0, num_workers=0, device=None, seed=0,
               subset_idx=None, subset_by_name=None,
@@ -171,7 +171,9 @@ def fit_model(h5_path, out_len, n_out, n_in, save_path,
 
     torch.manual_seed(seed)
     full_ds = H5DRMDataset(h5_path, use_log_target=True,
-                           subset_idx=subset_idx, subset_by_name=subset_by_name)
+                       subset_idx=subset_idx, subset_by_name=subset_by_name,
+                       preload=True)
+
     N = len(full_ds)
     N_val = max(1, int(val_frac * N))
     N_trn = N - N_val
@@ -183,7 +185,9 @@ def fit_model(h5_path, out_len, n_out, n_in, save_path,
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     model = DRMNet(out_len=out_len, use_embedding=use_embedding, num_det=num_det,
-                   emb_dim=emb_dim, hidden=hidden, use_log_target=True).to(device)
+                   emb_dim=emb_dim, hidden=hidden, use_log_target=True,
+                   low_rank_k=low_rank_k).to(device)
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -203,9 +207,9 @@ def fit_model(h5_path, out_len, n_out, n_in, save_path,
 
     for ep in range(1, epochs + 1):
         t0 = time.time()
-        trn = train_one_epoch(model, train_loader, opt, device, n_out, n_in, lam_smooth)
-        val = eval_one_epoch(model, val_loader, device, n_out, n_in, lam_smooth)
-        extra = eval_metrics_linear(model, val_loader, device)
+        trn = train_one_epoch(model, train_loader, opt, device, n_out, n_in, lam_smooth, progress=True)
+        val = eval_one_epoch(model, val_loader, device, n_out, n_in, lam_smooth, progress=True)
+        extra = eval_metrics_linear(model, val_loader, device, progress=True)
         sched.step()
         lr_now = sched.get_last_lr()[0]
         dt = time.time() - t0
