@@ -159,7 +159,7 @@ def eval_metrics_linear(model, loader, device, progress=True):
 
 def fit_model(h5_path, out_len, n_out, n_in, save_path,
               use_embedding=False, num_det=12,
-              hidden=(256, 512, 512), emb_dim=8, low_rank_k=None,
+              hidden=(128, 256, 16), emb_dim=8, low_rank_k=None,
               batch_size=128, lr=1e-3, epochs=30, val_frac=0.1,
               lam_smooth=0.0, num_workers=0, device=None, seed=0,
               subset_idx=None, subset_by_name=None,
@@ -245,6 +245,9 @@ def fit_model(h5_path, out_len, n_out, n_in, save_path,
                     "out_len": out_len, "n_out": n_out, "n_in": n_in,
                     "use_embedding": use_embedding, "num_det": num_det,
                     "hidden": tuple(hidden), "emb_dim": int(emb_dim),
+                    # Optional extras:
+                    # "use_log_target": True,
+                    # "low_rank_k": int(low_rank_k) if low_rank_k is not None else 0,
                 },
             }, save_path)
             bad_epochs = 0

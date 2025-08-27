@@ -1,20 +1,45 @@
 import torch
 from .model import DRMNet
 
+def _infer_hidden_from_state(sd):
+    hidden = []
+    in_dim = None
+    out_len = None
+    idx = 0
+    while True:
+        key = f"mlp.{idx}.weight"
+        if key not in sd:
+            break
+        w = sd[key]
+        outd, ind = w.shape
+        if idx == 0:
+            in_dim = int(ind)
+        next_key = f"mlp.{idx+2}.weight"
+        if next_key in sd:
+            hidden.append(int(outd))
+        else:
+            out_len = int(outd)
+        idx += 2
+    return tuple(hidden), out_len
+
 @torch.no_grad()
 def load_model(ckpt_path, device=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(ckpt_path, map_location=device)
-    cfg = ckpt["cfg"]
-    hidden = tuple(cfg.get("hidden", (256, 512, 512)))
+    cfg = ckpt.get("cfg", {})
+    sd  = ckpt.get("model", ckpt)
+
+    # Prefer hidden from cfg; fall back to inference
+    hidden = tuple(cfg.get("hidden", ())) or _infer_hidden_from_state(sd)[0]
     emb_dim = int(cfg.get("emb_dim", 8))
+
     model = DRMNet(out_len=cfg["out_len"],
-                   use_embedding=cfg["use_embedding"],
-                   num_det=cfg["num_det"],
+                   use_embedding=cfg.get("use_embedding", False),
+                   num_det=cfg.get("num_det", 12),
                    emb_dim=emb_dim,
                    hidden=hidden)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(sd)
     model.to(device).eval()
     return model, cfg, device
 

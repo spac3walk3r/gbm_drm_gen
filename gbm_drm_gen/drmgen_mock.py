@@ -36,7 +36,7 @@ class _StaticPositionInterpolator:
 class DRMGenMock(DRMGen):
     def __init__(self,
                  det_name,
-                 mat_type=0,
+                 mat_type=2,
                  occult=False,
                  time=0.0,
                  ebin_edge_in=None,

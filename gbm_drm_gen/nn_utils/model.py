@@ -20,8 +20,7 @@ class DRMNet(nn.Module):
     - For BGO models (one per detector): use_embedding=False
     """
     def __init__(self, out_len, use_embedding=False, num_det=12, emb_dim=8,
-                 hidden=(256, 512, 512), use_log_target=True, low_rank_k=None):
-                 #hidden=(128, 256), use_log_target=True):
+                 hidden=(128, 256, 16), use_log_target=True, low_rank_k=None):
                  
         super().__init__()
         self.use_embedding = use_embedding
