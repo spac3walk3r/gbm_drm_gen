@@ -20,7 +20,6 @@ def _azzen_to_unitvec(az_deg, zen_deg):
 DET_NORMAL = {k: _azzen_to_unitvec(*v) for k, v in DET_ORIENT_DEG.items()}
 
 def _infer_mlp_from_state(sd):
-    # Infer first Linear input dim, hidden sizes, and out_len from mlp.*.weight tensors
     hidden = []
     in_dim = None
     out_len = None
@@ -33,12 +32,11 @@ def _infer_mlp_from_state(sd):
         outd, ind = w.shape
         if idx == 0:
             in_dim = int(ind)
-        # If there is another linear after this, treat this as a hidden layer
         next_key = f"mlp.{idx+2}.weight"
         if next_key in sd:
             hidden.append(int(outd))
         else:
-            out_len = int(outd)  # final layer
+            out_len = int(outd)
         idx += 2
     if in_dim is None or out_len is None:
         raise RuntimeError("Cannot infer MLP layout from state_dict")
@@ -57,41 +55,36 @@ class ModelRegistry:
     def _load_one(self, path):
         t = self._torch
         ckpt = t.load(path, map_location=self._dev)
-        # Allow both styles: {"model": state_dict, "cfg": {...}} or plain state_dict
         cfg = ckpt.get("cfg", {})
         sd = ckpt.get("model", ckpt)
 
-        # Build DRMNet to match the checkpoint exactly
         from gbm_drm_gen.nn_utils.model import DRMNet
 
-        # Infer hidden layout and out_len from the tensors (e.g., (128, 256, 16) and 17920)
         in_dim_ckpt, hidden_ckpt, out_len_ckpt = _infer_mlp_from_state(sd)
 
-        # Embedding info from cfg
         use_embedding = bool(cfg.get("use_embedding", False))
         emb_dim = int(cfg.get("emb_dim", 0))
         num_det = int(cfg.get("num_det", 12))
+        target_transform = cfg.get("target_transform", "log1p")
+        log10_eps = float(cfg.get("log10_eps", 1e-12))
 
-        # Construct model
         model = DRMNet(
             out_len=out_len_ckpt,
             use_embedding=use_embedding,
             num_det=num_det,
             emb_dim=emb_dim,
             hidden=hidden_ckpt,
-            use_log_target=bool(cfg.get("use_log_target", True)),
+            use_log_target=(target_transform in ("log1p", "log10")),
             low_rank_k=cfg.get("low_rank_k", None),
         )
         model.load_state_dict(sd, strict=True)
         model.to(self._dev).eval()
 
-        # Normalize cfg so downstream code sees the true values
-        cfg = dict(cfg)  # copy
+        cfg = dict(cfg)
         cfg["out_len"] = out_len_ckpt
         cfg["hidden"] = hidden_ckpt
-
-        # Keep n_in/n_out if present; they are used to reshape the flat vector
-        # If missing, try to keep current ones; otherwise, you can set them here.
+        cfg["target_transform"] = target_transform
+        cfg["log10_eps"] = log10_eps
 
         return model, cfg
 
@@ -99,7 +92,21 @@ class ModelRegistry:
         with self._lock:
             if self._loaded:
                 return
+
+            # Configure threading before importing torch
+            os.environ.setdefault("OMP_NUM_THREADS", "16")
+            os.environ.setdefault("MKL_NUM_THREADS", "16")
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
+            os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
             self._torch = _lazy_torch()
+            # Set PyTorch threads (best effort; must be before any parallel regions)
+            try:
+                self._torch.set_num_threads(16)
+                self._torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+
             # NaI (single model for all 12)
             p = os.path.join(self._dir, "drmnet_nai.pt")
             if os.path.exists(p):
@@ -115,7 +122,10 @@ class ModelRegistry:
             self._loaded = True
 
     def predict(self, det_name, src_az, src_el, geo_az, geo_el):
-        # Note: DRMNet expects angles in degrees (it converts to trig internally).
+        """
+        Returns DRM matrix [n_out, n_in] on linear scale.
+        Angles in degrees, spacecraft frame.
+        """
         self._lazy_load()
         t = self._torch
         key = "NAI" if det_name.startswith("NAI_") else det_name
@@ -129,15 +139,21 @@ class ModelRegistry:
 
         with t.no_grad():
             if cfg.get("use_embedding", False):
-                det_id = t.tensor([DET_NAME_TO_ID[det_name]], dtype=t.long, device=self._dev)
-                yhat_log = model(angles, normals, det_id)
+                det_id_t = t.tensor([DET_NAME_TO_ID[det_name]], dtype=t.long, device=self._dev)
+                y_trans = model(angles_deg=angles, normals=normals, det_id=det_id_t)
             else:
-                yhat_log = model(angles, normals, None)
-            drm = t.expm1(yhat_log).clamp_min_(0.0)
+                y_trans = model(angles_deg=angles, normals=normals, det_id=None)
 
-            # Reshape using cfg-provided n_out/n_in (your checkpoint had n_out=128, n_in=140)
-            n_out = int(cfg.get("n_out", 128))
-            n_in = int(cfg.get("n_in", 140))
-            drm = drm.view(n_out, n_in).cpu().numpy()
+            # invert target transform
+            target_transform = cfg.get("target_transform", "log1p")
+            log10_eps = float(cfg.get("log10_eps", 1e-12))
+            if target_transform == "log10":
+                drm_flat = (10.0 ** y_trans - log10_eps).clamp_min_(0.0)
+            else:
+                drm_flat = t.expm1(y_trans).clamp_min_(0.0)
 
-        return drm  # (n_out, n_in)
+            n_out = int(cfg.get("n_out", 140))
+            n_in  = int(cfg.get("n_in", 128))
+            drm = drm_flat.view(n_out, n_in).cpu().numpy()
+
+        return drm
