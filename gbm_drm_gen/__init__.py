@@ -2,6 +2,7 @@ from .drmgen import DRMGen
 from .drmgen_tte import DRMGenTTE
 from .drmgen_trig import DRMGenTrig
 from .drmgen_mock import DRMGenMock
+from .drmgen_nn import DRMGenNN
 
 
 from .create_rsp2 import create_rsp2
@@ -28,6 +29,7 @@ __all__ = [
     "DRMGenTTE",
     "DRMGenTrig",
     "DRMGenMock",
+    "DRMGenNN",
     "NaiTTEEdges",
     "BgoTTEEdges",
     "BALROG_DRM",
